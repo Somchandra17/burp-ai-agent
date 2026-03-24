@@ -21,50 +21,62 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-class OpenAiCompatibleBackend : AiBackend {
-    override val id: String = "openai-compatible"
-    override val displayName: String = "Generic (OpenAI-compatible)"
+class OpenAiCompatibleBackend(
+    override val id: String = "openai-compatible",
+    override val displayName: String = "Generic (OpenAI-compatible)",
+    private val defaultBaseUrl: String = "",
+    private val baseUrlSelector: (AgentSettings) -> String = { it.openAiCompatibleUrl.trim() },
+    private val modelSelector: (AgentSettings) -> String = { it.openAiCompatibleModel.trim() },
+    private val apiKeySelector: (AgentSettings) -> String = { it.openAiCompatibleApiKey },
+    private val headersSelector: (AgentSettings) -> String = { it.openAiCompatibleHeaders },
+    private val timeoutSelector: (AgentSettings) -> Int = { it.openAiCompatibleTimeoutSeconds }
+) : AiBackend {
     override val supportsSystemRole: Boolean = true
 
     private val mapper = ObjectMapper().registerKotlinModule()
 
     override fun launch(config: BackendLaunchConfig): AgentConnection {
-        val baseUrl = config.baseUrl?.trimEnd('/') ?: ""
+        val baseUrl = effectiveBaseUrl(config.baseUrl)
         val model = config.model?.ifBlank { "" } ?: ""
         val timeoutSeconds = (config.requestTimeoutSeconds ?: 120L).coerceIn(30L, 3600L)
         val client = HttpBackendSupport.sharedClient(baseUrl, timeoutSeconds)
         return OpenAiCompatibleConnection(
             client = client,
             mapper = mapper,
+            backendId = id,
+            backendDisplayName = displayName,
             baseUrl = baseUrl,
             model = model,
             headers = config.headers,
             determinismMode = config.determinismMode,
             sessionId = config.sessionId,
             circuitBreaker = HttpBackendSupport.newCircuitBreaker(),
-            debugLog = { BackendDiagnostics.log("[openai-compatible] $it") },
-            errorLog = { BackendDiagnostics.logError("[openai-compatible] $it") }
+            debugLog = { BackendDiagnostics.log("[$id] $it") },
+            errorLog = { BackendDiagnostics.logError("[$id] $it") }
         )
     }
 
     override fun healthCheck(settings: AgentSettings): HealthCheckResult {
-        val baseUrl = settings.openAiCompatibleUrl.trim()
+        val baseUrl = effectiveBaseUrl(baseUrlSelector(settings))
         if (baseUrl.isBlank()) {
-            return HealthCheckResult.Unavailable("OpenAI-compatible URL is empty.")
+            return HealthCheckResult.Unavailable("$displayName URL is empty.")
         }
         val headers = HeaderParser.withBearerToken(
-            settings.openAiCompatibleApiKey,
-            HeaderParser.parse(settings.openAiCompatibleHeaders)
+            apiKeySelector(settings),
+            HeaderParser.parse(headersSelector(settings))
         )
         return HttpBackendSupport.healthCheckGet(
             url = buildModelsUrl(baseUrl),
-            headers = headers
+            headers = headers,
+            timeoutSeconds = timeoutSelector(settings).coerceIn(1, 30).toLong()
         )
     }
 
     private class OpenAiCompatibleConnection(
         private val client: okhttp3.OkHttpClient,
         private val mapper: ObjectMapper,
+        private val backendId: String,
+        private val backendDisplayName: String,
         private val baseUrl: String,
         private val model: String,
         private val headers: Map<String, String>,
@@ -76,7 +88,7 @@ class OpenAiCompatibleBackend : AiBackend {
     ) : AgentConnection, UsageAwareConnection {
         private val alive = AtomicBoolean(true)
         private val exec = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "openai-compatible-connection").apply { isDaemon = true }
+            Thread(runnable, "$backendId-connection").apply { isDaemon = true }
         }
         private val conversationHistory = ConversationHistory(20)
         private val lastTokenUsageRef = AtomicReference<TokenUsage?>(null)
@@ -110,7 +122,7 @@ class OpenAiCompatibleBackend : AiBackend {
                     while (attempt < maxAttempts) {
                         val permission = circuitBreaker.tryAcquire()
                         if (!permission.allowed) {
-                            val failFastError = HttpBackendSupport.openCircuitError("OpenAI-compatible", permission.retryAfterMs)
+                            val failFastError = HttpBackendSupport.openCircuitError(backendDisplayName, permission.retryAfterMs)
                             debugLog("circuit open: ${failFastError.message}")
                             onComplete(failFastError)
                             return@submit
@@ -149,12 +161,12 @@ class OpenAiCompatibleBackend : AiBackend {
                                 if (!resp.isSuccessful) {
                                     val bodyText = resp.body?.string().orEmpty()
                                     errorLog("HTTP ${resp.code}: ${bodyText.take(500)}")
-                                    onComplete(IllegalStateException("OpenAI-compatible HTTP ${resp.code}: $bodyText"))
+                                    onComplete(IllegalStateException("$backendDisplayName HTTP ${resp.code}: $bodyText"))
                                     return@submit
                                 }
                                 val body = resp.body?.string().orEmpty()
                                 if (body.isBlank()) {
-                                    onComplete(IllegalStateException("OpenAI-compatible response body was empty"))
+                                    onComplete(IllegalStateException("$backendDisplayName response body was empty"))
                                     return@submit
                                 }
                                 val node = mapper.readTree(body)
@@ -171,7 +183,7 @@ class OpenAiCompatibleBackend : AiBackend {
                                     )
                                 }
                                 if (content.isBlank()) {
-                                    onComplete(IllegalStateException("OpenAI-compatible response content was empty"))
+                                    onComplete(IllegalStateException("$backendDisplayName response content was empty"))
                                     return@submit
                                 }
                                 debugLog("response <- ${content.take(200)}")
@@ -191,7 +203,7 @@ class OpenAiCompatibleBackend : AiBackend {
                                 throw e
                             }
                             val delayMs = HttpBackendSupport.retryDelayMs(attempt)
-                            BackendDiagnostics.logRetry("openai-compatible", attempt + 1, delayMs, e.message)
+                            BackendDiagnostics.logRetry(backendId, attempt + 1, delayMs, e.message)
                             debugLog("retrying in ${delayMs}ms after: ${e.message}")
                             try {
                                 Thread.sleep(delayMs)
@@ -245,5 +257,13 @@ class OpenAiCompatibleBackend : AiBackend {
             if (versionedBaseRegex.matches(trimmed)) return "$trimmed/models"
             return "$trimmed/v1/models"
         }
+    }
+
+    private fun effectiveBaseUrl(candidate: String?): String {
+        val trimmed = candidate?.trim()?.trimEnd('/').orEmpty()
+        if (trimmed.isNotBlank()) {
+            return trimmed
+        }
+        return defaultBaseUrl.trim().trimEnd('/')
     }
 }
