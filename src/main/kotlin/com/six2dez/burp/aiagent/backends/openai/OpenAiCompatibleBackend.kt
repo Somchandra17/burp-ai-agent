@@ -161,7 +161,15 @@ class OpenAiCompatibleBackend(
                                 if (!resp.isSuccessful) {
                                     val bodyText = resp.body?.string().orEmpty()
                                     errorLog("HTTP ${resp.code}: ${bodyText.take(500)}")
-                                    onComplete(IllegalStateException("$backendDisplayName HTTP ${resp.code}: $bodyText"))
+                                    val retryAfter = resp.header("Retry-After")
+                                    val message = when (resp.code) {
+                                        429 -> {
+                                            val retryHint = retryAfter?.takeIf { it.isNotBlank() }?.let { " Retry after: $it." }.orEmpty()
+                                            "$backendDisplayName rate limited (HTTP 429). Check quota/capacity or retry later.$retryHint"
+                                        }
+                                        else -> "$backendDisplayName HTTP ${resp.code}: $bodyText"
+                                    }
+                                    onComplete(IllegalStateException(message))
                                     return@submit
                                 }
                                 val body = resp.body?.string().orEmpty()
