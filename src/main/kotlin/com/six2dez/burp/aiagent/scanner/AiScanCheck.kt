@@ -9,8 +9,11 @@ import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPoint
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
+import com.six2dez.burp.aiagent.audit.ActivityType
+import com.six2dez.burp.aiagent.audit.AiRequestLogger
 import com.six2dez.burp.aiagent.config.AgentSettings
 import com.six2dez.burp.aiagent.util.IssueUtils
+import java.util.UUID
 
 /**
  * Burp Scanner API integration (Option A - Burp Pro only)
@@ -22,6 +25,7 @@ class AiScanCheck(
     private val api: MontoyaApi,
     private val getSettings: () -> AgentSettings
 ) : ScanCheck {
+    var aiRequestLogger: AiRequestLogger? = null
 
     private val payloadGenerator = PayloadGenerator()
     private val responseAnalyzer = ResponseAnalyzer()
@@ -148,6 +152,7 @@ class AiScanCheck(
         vulnClass: VulnClass
     ): AuditIssue? {
         val settings = getSettings()
+        val traceId = "burp-scancheck-" + UUID.randomUUID().toString()
         
         // Build request with payload using Burp's ByteArray
         val payloadBytes = burp.api.montoya.core.ByteArray.byteArray(payload.value)
@@ -165,17 +170,27 @@ class AiScanCheck(
         
         // Measure baseline if needed for time-based
         val baselineTime = if (payload.detectionMethod == DetectionMethod.BLIND_TIME) {
-            val start = System.currentTimeMillis()
-            api.http().sendRequest(baseRequestResponse.request())
-            System.currentTimeMillis() - start
+            sendRequestLogged(
+                request = baseRequestResponse.request(),
+                traceId = traceId,
+                insertionPoint = insertionPoint,
+                vulnClass = vulnClass,
+                payload = payload,
+                phase = "baseline"
+            )?.durationMs ?: return null
         } else 0L
         
         // Send attack request
-        val startTime = System.currentTimeMillis()
-        val attackResponse = api.http().sendRequest(attackRequest)
-        val responseTime = System.currentTimeMillis() - startTime
-        
-        val attackRequestResponse = HttpRequestResponse.httpRequestResponse(attackRequest, attackResponse.response())
+        val attackResult = sendRequestLogged(
+            request = attackRequest,
+            traceId = traceId,
+            insertionPoint = insertionPoint,
+            vulnClass = vulnClass,
+            payload = payload,
+            phase = "attack"
+        ) ?: return null
+        val responseTime = attackResult.durationMs
+        val attackRequestResponse = attackResult.requestResponse
         
         // Analyze response
         val confirmed = when (payload.detectionMethod) {
@@ -316,6 +331,136 @@ _(Confirmed via active exploitation testing integrated with Burp Scanner)_
             DetectionMethod.BLIND_BOOLEAN -> AuditIssueConfidence.TENTATIVE
             DetectionMethod.OUT_OF_BAND -> AuditIssueConfidence.FIRM
         }
+    }
+
+    private fun sendRequestLogged(
+        request: burp.api.montoya.http.message.requests.HttpRequest,
+        traceId: String,
+        insertionPoint: AuditInsertionPoint,
+        vulnClass: VulnClass,
+        payload: Payload,
+        phase: String
+    ): RequestDispatchResult? {
+        val startMs = System.currentTimeMillis()
+        recordRequestDispatch(request, traceId, insertionPoint, vulnClass, payload, phase)
+        return try {
+            val requestResponse = api.http().sendRequest(request)
+            val durationMs = System.currentTimeMillis() - startMs
+            persistTraffic(requestResponse)
+            recordRequestResponse(requestResponse, durationMs, traceId, insertionPoint, vulnClass, payload, phase)
+            RequestDispatchResult(requestResponse, durationMs)
+        } catch (e: Exception) {
+            val durationMs = System.currentTimeMillis() - startMs
+            recordRequestError(request, e.message ?: "request error", durationMs, traceId, insertionPoint, vulnClass, payload, phase)
+            throw e
+        }
+    }
+
+    private fun recordRequestDispatch(
+        request: burp.api.montoya.http.message.requests.HttpRequest,
+        traceId: String,
+        insertionPoint: AuditInsertionPoint,
+        vulnClass: VulnClass,
+        payload: Payload,
+        phase: String
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.SCANNER_SEND,
+            source = "burp_scancheck",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Burp scan check [$phase]: ${request.method()} ${request.url().take(120)}",
+            metadata = logMetadata(traceId, insertionPoint, vulnClass, payload, phase) + mapOf(
+                "operation" to "active_test",
+                "status" to "sent",
+                "url" to request.url().take(200),
+                "method" to request.method()
+            )
+        )
+    }
+
+    private fun recordRequestResponse(
+        requestResponse: HttpRequestResponse,
+        durationMs: Long,
+        traceId: String,
+        insertionPoint: AuditInsertionPoint,
+        vulnClass: VulnClass,
+        payload: Payload,
+        phase: String
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.RESPONSE_COMPLETE,
+            source = "burp_scancheck",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Burp scan check [$phase] completed: ${requestResponse.request().method()} ${requestResponse.request().url().take(120)}",
+            durationMs = durationMs,
+            responseChars = requestResponse.response()?.bodyToString()?.length ?: 0,
+            metadata = logMetadata(traceId, insertionPoint, vulnClass, payload, phase) + mapOf(
+                "operation" to "active_test",
+                "status" to "ok",
+                "url" to requestResponse.request().url().take(200),
+                "method" to requestResponse.request().method(),
+                "httpStatus" to (requestResponse.response()?.statusCode()?.toString() ?: "0")
+            )
+        )
+    }
+
+    private fun recordRequestError(
+        request: burp.api.montoya.http.message.requests.HttpRequest,
+        error: String,
+        durationMs: Long,
+        traceId: String,
+        insertionPoint: AuditInsertionPoint,
+        vulnClass: VulnClass,
+        payload: Payload,
+        phase: String
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.ERROR,
+            source = "burp_scancheck",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Burp scan check [$phase] failed: ${error.take(200)}",
+            durationMs = durationMs,
+            metadata = logMetadata(traceId, insertionPoint, vulnClass, payload, phase) + mapOf(
+                "operation" to "active_test",
+                "status" to "error",
+                "url" to request.url().take(200),
+                "method" to request.method()
+            )
+        )
+    }
+
+    private fun logMetadata(
+        traceId: String,
+        insertionPoint: AuditInsertionPoint,
+        vulnClass: VulnClass,
+        payload: Payload,
+        phase: String
+    ): Map<String, String> {
+        return mapOf(
+            "traceId" to traceId,
+            "phase" to phase,
+            "vulnClass" to vulnClass.name,
+            "injectionPoint" to insertionPoint.name().take(200),
+            "payloadType" to payload.detectionMethod.name,
+            "payloadPreview" to payload.value.take(200)
+        )
+    }
+
+    private fun persistTraffic(requestResponse: HttpRequestResponse) {
+        try {
+            api.siteMap().add(requestResponse)
+        } catch (e: Exception) {
+            api.logging().logToError("[AiScanCheck] Failed to persist request/response to Site Map: ${e.message}")
+        }
+    }
+
+    private data class RequestDispatchResult(
+        val requestResponse: HttpRequestResponse,
+        val durationMs: Long
+    )
+
+    private companion object {
+        private const val ACTIVE_SCANNER_BACKEND_ID = "burp-http"
     }
 
 }

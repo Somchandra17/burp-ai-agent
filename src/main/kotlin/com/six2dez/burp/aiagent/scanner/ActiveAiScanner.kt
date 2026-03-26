@@ -2,6 +2,8 @@ package com.six2dez.burp.aiagent.scanner
 
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.http.message.HttpRequestResponse
+import burp.api.montoya.http.message.params.HttpParameter
+import burp.api.montoya.http.message.params.HttpParameterType
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
@@ -1164,72 +1166,134 @@ class ActiveAiScanner(
     private fun injectPayload(request: HttpRequest, point: InjectionPoint, payload: String): HttpRequest {
         return when (point.type) {
             InjectionType.URL_PARAM -> {
-                val url = request.url()
-                val newUrl = url.replace(
-                    "${point.name}=${java.net.URLEncoder.encode(point.originalValue, "UTF-8")}",
-                    "${point.name}=${java.net.URLEncoder.encode(payload, "UTF-8")}"
-                ).replace(
-                    "${point.name}=${point.originalValue}",
-                    "${point.name}=${java.net.URLEncoder.encode(payload, "UTF-8")}"
-                )
-                request.withPath(newUrl.substringAfter(request.httpService().host()).substringBefore("?").ifEmpty { "/" })
-                    .let { req ->
-                        val query = newUrl.substringAfter("?", "")
-                        if (query.isNotEmpty()) {
-                            HttpRequest.httpRequest(req.httpService(), "${req.method()} ${req.path()}?$query ${req.httpVersion()}\r\n${req.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }}\r\n\r\n${req.bodyToString()}")
-                        } else req
-                    }
+                updateRequestParameter(request, HttpParameter.urlParameter(point.name, payload)) {
+                    it.query() != request.query() || it.url() != request.url()
+                } ?: replaceQueryParameter(request, point.name, payload)
             }
             InjectionType.BODY_PARAM -> {
-                val body = request.bodyToString()
-                val newBody = body.replace(
-                    "${point.name}=${point.originalValue}",
-                    "${point.name}=${java.net.URLEncoder.encode(payload, "UTF-8")}"
-                )
-                request.withBody(newBody)
+                updateRequestParameter(request, HttpParameter.bodyParameter(point.name, payload)) {
+                    it.bodyToString() != request.bodyToString()
+                } ?: replaceBodyParameter(request, point.name, payload)
             }
             InjectionType.HEADER -> {
-                request.withRemovedHeader(point.name)
-                    .withAddedHeader(point.name, payload)
+                request.withUpdatedHeader(point.name, payload)
             }
             InjectionType.COOKIE -> {
-                val cookies = request.headerValue("Cookie") ?: ""
-                val newCookies = cookies.replace(
-                    "${point.name}=${point.originalValue}",
-                    "${point.name}=$payload"
-                )
-                request.withRemovedHeader("Cookie").withAddedHeader("Cookie", newCookies)
+                updateRequestParameter(request, HttpParameter.cookieParameter(point.name, payload)) {
+                    (it.headerValue("Cookie") ?: "") != (request.headerValue("Cookie") ?: "")
+                } ?: replaceCookieParameter(request, point.name, payload)
             }
             InjectionType.PATH_SEGMENT -> {
-                val path = request.path()
-                val newPath = path.replace(point.originalValue, payload)
-                request.withPath(newPath)
+                replacePathSegment(request, point, payload)
             }
             InjectionType.JSON_FIELD -> {
-                val body = request.bodyToString()
-                val numericPattern = Regex("-?\\d+(?:\\.\\d+)?")
-                val isNumericOriginal = numericPattern.matches(point.originalValue)
-                val isNumericPayload = numericPattern.matches(payload)
-                val replacementValue = if (isNumericOriginal && isNumericPayload) payload else "\"$payload\""
-                val fieldPattern = Regex(
-                    "\"${Regex.escape(point.name)}\"\\s*:\\s*\"?${Regex.escape(point.originalValue)}\"?"
-                )
-                val newBody = fieldPattern.replace(
-                    body,
-                    "\"${point.name}\":$replacementValue"
-                )
-                request.withBody(newBody)
+                updateRequestParameter(
+                    request,
+                    HttpParameter.parameter(point.name, payload, HttpParameterType.JSON)
+                ) {
+                    it.bodyToString() != request.bodyToString()
+                } ?: replaceJsonField(request, point, payload)
             }
             InjectionType.XML_ELEMENT -> {
-                val body = request.bodyToString()
-                val newBody = body.replace(
-                    "<${point.name}>${point.originalValue}</${point.name}>",
-                    "<${point.name}>$payload</${point.name}>"
-                )
-                request.withBody(newBody)
+                updateRequestParameter(
+                    request,
+                    HttpParameter.parameter(point.name, payload, HttpParameterType.XML)
+                ) {
+                    it.bodyToString() != request.bodyToString()
+                } ?: replaceXmlElement(request, point, payload)
             }
         }
     }
+
+    private fun updateRequestParameter(
+        request: HttpRequest,
+        parameter: HttpParameter,
+        applied: (HttpRequest) -> Boolean
+    ): HttpRequest? {
+        return try {
+            val updated = request.withUpdatedParameters(parameter)
+            updated.takeIf(applied)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun replaceQueryParameter(request: HttpRequest, name: String, payload: String): HttpRequest {
+        val updatedQuery = replaceDelimitedParameter(request.query(), name, urlEncode(payload), '&')
+            ?: return request
+        return request.withPath(buildPath(request.pathWithoutQuery(), updatedQuery))
+    }
+
+    private fun replaceBodyParameter(request: HttpRequest, name: String, payload: String): HttpRequest {
+        val updatedBody = replaceDelimitedParameter(request.bodyToString(), name, urlEncode(payload), '&')
+            ?: return request
+        return request.withBody(updatedBody)
+    }
+
+    private fun replaceCookieParameter(request: HttpRequest, name: String, payload: String): HttpRequest {
+        val cookies = request.headerValue("Cookie") ?: return request
+        var replaced = false
+        val updatedCookies = cookies.split(";").joinToString("; ") { rawPart ->
+            val part = rawPart.trim()
+            if (!replaced && part.substringBefore("=", "") == name) {
+                replaced = true
+                "$name=$payload"
+            } else {
+                part
+            }
+        }
+        if (!replaced) return request
+        return request.withUpdatedHeader("Cookie", updatedCookies)
+    }
+
+    private fun replacePathSegment(request: HttpRequest, point: InjectionPoint, payload: String): HttpRequest {
+        val path = request.path()
+        val newPath = if (point.position != null) {
+            val end = point.position + point.originalValue.length
+            if (point.position >= 0 && end <= path.length && path.substring(point.position, end) == point.originalValue) {
+                path.replaceRange(point.position, end, payload)
+            } else {
+                path.replaceFirst(Regex.escape(point.originalValue).toRegex(), payload)
+            }
+        } else {
+            path.replaceFirst(Regex.escape(point.originalValue).toRegex(), payload)
+        }
+        return request.withPath(newPath)
+    }
+
+    private fun replaceJsonField(request: HttpRequest, point: InjectionPoint, payload: String): HttpRequest {
+        val body = request.bodyToString()
+        val numericPattern = Regex("-?\\d+(?:\\.\\d+)?")
+        val isNumericOriginal = numericPattern.matches(point.originalValue)
+        val isNumericPayload = numericPattern.matches(payload)
+        val replacementValue = if (isNumericOriginal && isNumericPayload) payload else "\"$payload\""
+        val fieldPattern = Regex(
+            "\"${Regex.escape(point.name)}\"\\s*:\\s*\"?${Regex.escape(point.originalValue)}\"?"
+        )
+        val newBody = fieldPattern.replaceFirst(body, "\"${point.name}\":$replacementValue")
+        return if (newBody == body) request else request.withBody(newBody)
+    }
+
+    private fun replaceXmlElement(request: HttpRequest, point: InjectionPoint, payload: String): HttpRequest {
+        val body = request.bodyToString()
+        val pattern = Regex("<${Regex.escape(point.name)}>${Regex.escape(point.originalValue)}</${Regex.escape(point.name)}>")
+        val newBody = pattern.replaceFirst(body, "<${point.name}>$payload</${point.name}>")
+        return if (newBody == body) request else request.withBody(newBody)
+    }
+
+    private fun replaceDelimitedParameter(input: String, name: String, encodedPayload: String, delimiter: Char): String? {
+        if (input.isEmpty()) return null
+        val pattern = Regex("(^|\\${delimiter})${Regex.escape(name)}=[^\\${delimiter}]*")
+        val match = pattern.find(input) ?: return null
+        val replacement = "${match.groupValues[1]}$name=$encodedPayload"
+        return input.replaceRange(match.range, replacement)
+    }
+
+    private fun buildPath(pathWithoutQuery: String, query: String): String {
+        return if (query.isBlank()) pathWithoutQuery else "$pathWithoutQuery?$query"
+    }
+
+    private fun urlEncode(value: String): String = java.net.URLEncoder.encode(value, Charsets.UTF_8)
 
     private fun extractInjectionPoints(requestResponse: HttpRequestResponse): List<InjectionPoint> {
         return InjectionPointExtractor.extract(requestResponse.request(), headerInjectionAllowlist)

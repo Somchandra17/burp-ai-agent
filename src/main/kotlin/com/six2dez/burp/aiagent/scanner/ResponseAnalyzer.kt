@@ -13,6 +13,11 @@ class ResponseAnalyzer {
         const val MIN_CONFIDENCE_TO_REPORT = 85
         const val HIGH_CONFIDENCE = 95
         const val MEDIUM_CONFIDENCE = 85
+        private val API_VERSION_ROUTE_REGEX = Regex("/api/(v(?:0|1)(?:/|\\b)|beta(?:/|\\b)|legacy(?:/|\\b)|internal(?:/|\\b))", RegexOption.IGNORE_CASE)
+        private val API_VERSION_SIGNAL_REGEX = Regex(
+            "(?:^|\\n)(?:x-api-version|api-version|deprecation|sunset|x-deprecated-version)\\s*:|\"(?:apiVersion|version|deprecatedVersion|supportedVersions)\"\\s*:\\s*(?:\\[[^\\]]*(?:v0|v1|beta|legacy|internal)[^\\]]*\\]|\"(?:v0|v1|beta|legacy|internal)[^\"]*\")|/api/(?:v0|v1|beta|legacy|internal)(?:/|\\b)",
+            RegexOption.IGNORE_CASE
+        )
     }
 
     // STRICT detection patterns - must be unambiguous indicators
@@ -348,7 +353,9 @@ class ResponseAnalyzer {
 
         // ===== API Version Bypass =====
         VulnClass.API_VERSION_BYPASS to listOf(
-            SuccessPattern(Regex("deprecated|legacy|old.*version|v0\\.|beta", RegexOption.IGNORE_CASE), 85, "Old API version accessible"),
+            SuccessPattern(Regex("(?:^|\\n)(?:x-api-version|api-version|deprecation|sunset|x-deprecated-version)\\s*:", RegexOption.IGNORE_CASE), 90, "API versioning header exposed"),
+            SuccessPattern(Regex("\"(?:apiVersion|version|deprecatedVersion|supportedVersions)\"\\s*:\\s*(?:\\[[^\\]]*(?:v0|v1|beta|legacy|internal)[^\\]]*\\]|\"(?:v0|v1|beta|legacy|internal)[^\"]*\")", RegexOption.IGNORE_CASE), 85, "Deprecated API version in structured response"),
+            SuccessPattern(API_VERSION_ROUTE_REGEX, 85, "Deprecated API route exposed"),
         ),
     )
     
@@ -399,6 +406,11 @@ class ResponseAnalyzer {
             // Cloud documentation
             Regex("aws.*documentation|metadata.*service.*docs", RegexOption.IGNORE_CASE),
             Regex("cloud.*security.*guide|instance.*metadata.*protection", RegexOption.IGNORE_CASE),
+        ),
+        VulnClass.API_VERSION_BYPASS to listOf(
+            Regex("swagger|openapi|api\\s+documentation|developer\\s+docs", RegexOption.IGNORE_CASE),
+            Regex("changelog|release\\s+notes|migration\\s+guide", RegexOption.IGNORE_CASE),
+            Regex("deprecated\\s+in\\s+v\\d|legacy\\s+support\\s+policy", RegexOption.IGNORE_CASE),
         ),
     )
 
@@ -550,6 +562,10 @@ class ResponseAnalyzer {
         fullResponse: String,
         originalFull: String
     ): VulnConfirmation? {
+        if (vulnClass == VulnClass.API_VERSION_BYPASS) {
+            return analyzeApiVersionBypass(original, modified, payload, fullResponse, originalFull)
+        }
+
         // Use both error and success patterns
         val allPatterns = mutableListOf<SuccessPattern>()
         errorPatterns[vulnClass]?.forEach { 
@@ -610,6 +626,47 @@ class ResponseAnalyzer {
         }
         
         return null
+    }
+
+    private fun analyzeApiVersionBypass(
+        original: HttpRequestResponse,
+        modified: HttpRequestResponse,
+        payload: Payload,
+        fullResponse: String,
+        originalFull: String
+    ): VulnConfirmation? {
+        val statusCode = modified.response()?.statusCode()?.toInt() ?: return null
+        if (statusCode !in 200..399) return null
+
+        val requestTarget = "${modified.request().method()} ${modified.request().url()}".lowercase()
+        val routeHint = API_VERSION_ROUTE_REGEX.containsMatchIn(requestTarget) ||
+            API_VERSION_ROUTE_REGEX.containsMatchIn(payload.value.lowercase())
+        val responseSignal = API_VERSION_SIGNAL_REGEX.find(fullResponse)
+        if (!routeHint && responseSignal == null) return null
+
+        val contentType = modified.response()?.headerValue("Content-Type").orEmpty().lowercase()
+        val body = modified.response()?.bodyToString().orEmpty().trimStart()
+        val looksApiResponse = contentType.contains("json") ||
+            contentType.contains("xml") ||
+            contentType.contains("problem+json") ||
+            body.startsWith("{") ||
+            body.startsWith("[") ||
+            body.startsWith("<")
+        if (!looksApiResponse && responseSignal == null) return null
+
+        val diff = calculateDifference(originalFull, fullResponse)
+        if (diff.similarity > 0.995 && responseSignal == null) return null
+
+        val evidence = responseSignal?.value?.replace('\n', ' ')?.take(80)
+            ?: modified.request().path().take(120)
+        return createConfirmation(
+            original,
+            modified,
+            payload,
+            VulnClass.API_VERSION_BYPASS,
+            if (responseSignal != null) 90 else 85,
+            "Deprecated API version accessible: '$evidence'"
+        )
     }
     
     private fun analyzeBooleanBased(
