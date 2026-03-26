@@ -1117,7 +1117,8 @@ $metadata
         for (item in issues) {
             val confidence = item.confidence ?: 0
             val title = (item.title ?: "AI Potential Issue").take(120)
-            val rawSeverity = item.severity ?: "Information"
+            if (shouldSuppressAiFinding(title)) continue
+            val rawSeverity = normalizeAiSeverity(title, item.severity)
             val reasoning = item.reasoning ?: ""
             val detail = buildString {
                 if (reasoning.isNotBlank()) {
@@ -1362,6 +1363,26 @@ $metadata
             lowerTitle.contains("source map") || lowerTitle.contains("sourcemap") -> VulnClass.SOURCEMAP_DISCLOSURE
             lowerTitle.contains(".git") || lowerTitle.contains("git exposure") || lowerTitle.contains("git repository") -> VulnClass.GIT_EXPOSURE
             lowerTitle.contains("backup") || lowerTitle.contains(".bak") || lowerTitle.contains(".old file") -> VulnClass.BACKUP_DISCLOSURE
+            lowerTitle.contains("version disclosure") ||
+                lowerTitle.contains("version leak") ||
+                lowerTitle.contains("server version") ||
+                lowerTitle.contains("framework version") ||
+                lowerTitle.contains("technology disclosure") ||
+                lowerTitle.contains("x-powered-by") -> VulnClass.VERSION_DISCLOSURE
+            lowerTitle.contains("insecure cookie") ||
+                lowerTitle.contains("cookie flags") ||
+                lowerTitle.contains("missing httponly") ||
+                lowerTitle.contains("missing secure") ||
+                lowerTitle.contains("session cookie") && lowerTitle.contains("secure") -> VulnClass.INSECURE_COOKIE
+            lowerTitle.contains("verbose error") ||
+                lowerTitle.contains("detailed error") ||
+                lowerTitle.contains("error disclosure") -> VulnClass.VERBOSE_ERROR
+            lowerTitle.contains("missing security header") ||
+                lowerTitle.contains("missing csp") ||
+                lowerTitle.contains("missing hsts") ||
+                lowerTitle.contains("missing x-frame-options") ||
+                lowerTitle.contains("missing x-content-type-options") -> VulnClass.MISSING_SECURITY_HEADERS
+            lowerTitle.contains("debug endpoint") -> VulnClass.DEBUG_ENDPOINT
             lowerTitle.contains("debug") || lowerTitle.contains("actuator") || lowerTitle.contains("profiler") -> VulnClass.DEBUG_EXPOSURE
             lowerTitle.contains("stack trace") || lowerTitle.contains("error leak") -> VulnClass.STACK_TRACE_EXPOSURE
 
@@ -1400,6 +1421,39 @@ $metadata
         }
     }
 
+    private fun normalizeAiSeverity(title: String, rawSeverity: String?): String {
+        val normalized = rawSeverity?.trim().orEmpty()
+        if (normalized.isBlank()) return "Information"
+        return when (normalized.lowercase()) {
+            "info", "informational", "information" -> {
+                val mappedClass = mapTitleToVulnClass(title)
+                if (mappedClass != null) {
+                    val mappedSeverity = ScannerIssueSupport.mapSeverity(mappedClass)
+                    if (mappedSeverity == AuditIssueSeverity.LOW || mappedSeverity == AuditIssueSeverity.INFORMATION) {
+                        "Low"
+                    } else {
+                        normalized.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                    }
+                } else {
+                    "Low"
+                }
+            }
+            "critical", "high", "medium", "low" ->
+                normalized.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            else -> normalized
+        }
+    }
+
+    private fun shouldSuppressAiFinding(title: String): Boolean {
+        val lowerTitle = title.lowercase()
+        return (lowerTitle.contains("missing security header") ||
+            lowerTitle.contains("missing csp") ||
+            lowerTitle.contains("missing hsts") ||
+            lowerTitle.contains("missing x-frame-options") ||
+            lowerTitle.contains("missing x-content-type-options")) ||
+            (lowerTitle.contains("rate limit") && !lowerTitle.contains("bypass"))
+    }
+
     private data class LocalFinding(
         val title: String,
         val severity: String,
@@ -1418,6 +1472,11 @@ $metadata
         detectCsrf(request, response)?.let { findings.add(it) }
         detectDeserialization(request, requestBody)?.let { findings.add(it) }
         detectUnrestrictedFileUpload(request, response, requestBody, responseBody)?.let { findings.add(it) }
+        detectVersionDisclosure(response)?.let { findings.add(it) }
+        detectInsecureCookie(response)?.let { findings.add(it) }
+        detectStackTraceExposure(response, responseBody)?.let { findings.add(it) }
+        detectDirectoryListing(responseBody)?.let { findings.add(it) }
+        detectDebugExposure(request, response, responseBody)?.let { findings.add(it) }
         return findings
     }
 
@@ -1546,6 +1605,130 @@ $metadata
             title = "Unrestricted File Upload (Executable Extension)",
             severity = "Medium",
             detail = "Upload accepted for '$filename' and response references the uploaded filename.",
+            confidence = 90
+        )
+    }
+
+    private fun detectVersionDisclosure(
+        response: burp.api.montoya.http.message.responses.HttpResponse?
+    ): LocalFinding? {
+        if (response == null) return null
+
+        val disclosures = response.headers().mapNotNull { header ->
+            val name = header.name().lowercase()
+            val value = header.value().trim()
+            when {
+                name == "server" && serverVersionRegex.containsMatchIn(value) -> "Server: $value"
+                name == "x-powered-by" && poweredByVersionRegex.containsMatchIn(value) -> "X-Powered-By: $value"
+                name == "x-aspnet-version" && aspNetVersionRegex.containsMatchIn(value) -> "X-AspNet-Version: $value"
+                else -> null
+            }
+        }
+        if (disclosures.isEmpty()) return null
+
+        return LocalFinding(
+            title = "Version Disclosure",
+            severity = "Low",
+            detail = "Response discloses technology version information: ${disclosures.joinToString("; ")}.",
+            confidence = 90
+        )
+    }
+
+    private fun detectInsecureCookie(
+        response: burp.api.montoya.http.message.responses.HttpResponse?
+    ): LocalFinding? {
+        if (response == null) return null
+
+        val insecureCookies = response.headers()
+            .filter { it.name().equals("Set-Cookie", ignoreCase = true) }
+            .mapNotNull { header ->
+                val value = header.value()
+                val cookieName = value.substringBefore('=').trim()
+                if (!authCookieHint.containsMatchIn(cookieName) && !authCookieHint.containsMatchIn(value)) {
+                    return@mapNotNull null
+                }
+
+                val missingFlags = mutableListOf<String>()
+                if (!value.contains("Secure", ignoreCase = true)) missingFlags.add("Secure")
+                if (!value.contains("HttpOnly", ignoreCase = true)) missingFlags.add("HttpOnly")
+                if (missingFlags.isEmpty()) return@mapNotNull null
+
+                "$cookieName missing ${missingFlags.joinToString("/")}"
+            }
+        if (insecureCookies.isEmpty()) return null
+
+        return LocalFinding(
+            title = "Insecure Cookie Flags",
+            severity = "Low",
+            detail = "Authentication-related cookies are missing security attributes: ${insecureCookies.joinToString("; ")}.",
+            confidence = 90
+        )
+    }
+
+    private fun detectStackTraceExposure(
+        response: burp.api.montoya.http.message.responses.HttpResponse?,
+        responseBody: String
+    ): LocalFinding? {
+        val status = response?.statusCode()?.toInt() ?: 0
+        val evidence = when {
+            javaStackTraceRegex.containsMatchIn(responseBody) -> "Java stack trace"
+            pythonTracebackRegex.containsMatchIn(responseBody) -> "Python traceback"
+            dotNetStackTraceRegex.containsMatchIn(responseBody) -> ".NET stack trace"
+            phpFatalErrorRegex.containsMatchIn(responseBody) -> "PHP fatal error"
+            nodeStackTraceRegex.containsMatchIn(responseBody) -> "Node.js stack trace"
+            else -> null
+        } ?: return null
+
+        if (status in 200..299 && !responseBody.contains("exception", ignoreCase = true)) return null
+
+        return LocalFinding(
+            title = "Stack Trace Exposure",
+            severity = "Medium",
+            detail = "Response exposes an application stack trace ($evidence).",
+            confidence = 95
+        )
+    }
+
+    private fun detectDirectoryListing(responseBody: String): LocalFinding? {
+        val evidence = when {
+            responseBody.contains("Index of /", ignoreCase = true) -> "Index of /"
+            responseBody.contains("<title>Directory listing for", ignoreCase = true) -> "Directory listing title"
+            responseBody.contains("[To Parent Directory]", ignoreCase = true) -> "IIS directory listing marker"
+            else -> null
+        } ?: return null
+
+        return LocalFinding(
+            title = "Directory Listing Enabled",
+            severity = "Low",
+            detail = "Response appears to expose a directory listing ($evidence).",
+            confidence = 90
+        )
+    }
+
+    private fun detectDebugExposure(
+        request: burp.api.montoya.http.message.requests.HttpRequest,
+        response: burp.api.montoya.http.message.responses.HttpResponse?,
+        responseBody: String
+    ): LocalFinding? {
+        val path = runCatching { URI(request.url()).path.orEmpty().lowercase() }.getOrDefault("")
+        val contentType = response?.headerValue("Content-Type").orEmpty().lowercase()
+
+        val evidence = when {
+            responseBody.contains("phpinfo()", ignoreCase = true) ||
+                (responseBody.contains("PHP Version", ignoreCase = true) &&
+                    responseBody.contains("Configuration", ignoreCase = true)) -> "PHP info page"
+            path.contains("actuator") &&
+                responseBody.contains("\"status\"", ignoreCase = true) &&
+                responseBody.contains("\"UP\"", ignoreCase = true) -> "Spring Actuator endpoint"
+            path.contains("profiler") && responseBody.contains("symfony", ignoreCase = true) -> "Symfony profiler endpoint"
+            path.contains("debug") && contentType.contains("html") && responseBody.contains("debug", ignoreCase = true) -> "Debug endpoint content"
+            else -> null
+        } ?: return null
+
+        return LocalFinding(
+            title = "Debug Exposure",
+            severity = "Medium",
+            detail = "Response appears to expose a production debug surface ($evidence).",
             confidence = 90
         )
     }
@@ -1855,6 +2038,14 @@ $metadata
         val SERIALIZED_NAME_REGEX = Regex("(data|payload|serialized|object|state|viewstate)", RegexOption.IGNORE_CASE)
         val CODE_FENCE_END_REGEX = Regex("\\s*```$", RegexOption.MULTILINE)
         val SENSITIVE_KEY_REGEX = Regex("(token|key|auth|session|jwt|cookie|password|secret)", RegexOption.IGNORE_CASE)
+        val serverVersionRegex = Regex("(apache|nginx|iis|tomcat|jetty|openresty|caddy)/\\d", RegexOption.IGNORE_CASE)
+        val poweredByVersionRegex = Regex("(php|asp\\.net|express|next\\.js|laravel|django|flask|servlet)/?\\d", RegexOption.IGNORE_CASE)
+        val aspNetVersionRegex = Regex("^\\d+(?:\\.\\d+){1,3}$", RegexOption.IGNORE_CASE)
+        val javaStackTraceRegex = Regex("at\\s+[a-zA-Z0-9_.]+\\([a-zA-Z0-9_.]+\\.java:\\d+\\)", RegexOption.IGNORE_CASE)
+        val pythonTracebackRegex = Regex("Traceback \\(most recent call last\\)", RegexOption.IGNORE_CASE)
+        val dotNetStackTraceRegex = Regex("at\\s+[a-zA-Z0-9_.]+\\s+in\\s+.*\\.cs:line\\s+\\d+", RegexOption.IGNORE_CASE)
+        val phpFatalErrorRegex = Regex("Fatal error:.*in\\s+/.*\\.php\\s+on\\s+line\\s+\\d+", RegexOption.IGNORE_CASE)
+        val nodeStackTraceRegex = Regex("at\\s+[a-zA-Z0-9_$.]+\\s+\\(.*\\.js:\\d+:\\d+\\)", RegexOption.IGNORE_CASE)
     }
 
     private fun buildMetadataSectionPlain(

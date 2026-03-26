@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-03-26
+
+### Fixed
+
+- **Passive Scanner Finding Normalization**:
+  - Passive AI findings now normalize version disclosure, insecure cookie flags, verbose errors, and related titles into the correct vulnerability classes for stable issue naming and deduplication.
+  - Informational AI severities tied to concrete low-severity findings are normalized so valid passive issues are no longer skipped.
+- **Passive Scanner Noise Reduction**:
+  - Suppressed unsupported AI findings for standalone missing security headers and plain rate-limiting absence to keep passive results aligned with the scanner prompt rules.
+- **Deterministic Passive Checks**:
+  - Added local passive checks for version disclosure, insecure cookie flags, stack trace exposure, directory listing, and debug exposure so common low-noise findings do not depend solely on model output.
+- **Scanner Regression Coverage**:
+  - Added tests covering passive title classification, severity normalization, unsupported finding suppression, and deterministic local passive detections.
+
 ## [0.4.0] - 2026-03-06
 
 
