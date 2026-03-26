@@ -6,6 +6,8 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
+import com.six2dez.burp.aiagent.audit.ActivityType
+import com.six2dez.burp.aiagent.audit.AiRequestLogger
 import com.six2dez.burp.aiagent.audit.AuditLogger
 import com.six2dez.burp.aiagent.config.AgentSettings
 import com.six2dez.burp.aiagent.config.Defaults
@@ -13,6 +15,7 @@ import com.six2dez.burp.aiagent.redact.PrivacyMode
 import com.six2dez.burp.aiagent.supervisor.AgentSupervisor
 import com.six2dez.burp.aiagent.util.IssueUtils
 import com.six2dez.burp.aiagent.util.IssueText
+import java.util.UUID
 import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -38,6 +41,8 @@ class ActiveAiScanner(
     private val audit: AuditLogger,
     private val getSettings: () -> AgentSettings
 ) {
+    var aiRequestLogger: AiRequestLogger? = null
+
     private val enabled = AtomicBoolean(false)
     private val scanning = AtomicBoolean(false)
     private val scanQueue = ConcurrentLinkedQueue<ActiveScanTarget>()
@@ -288,6 +293,7 @@ class ActiveAiScanner(
     private fun executeScan(target: ActiveScanTarget): ActiveScanResult {
         val settings = getSettings()
         val vulnClass = target.vulnHint.vulnClass
+        val traceId = "active-scan-" + UUID.randomUUID().toString()
 
         if (vulnClass in ScanPolicy.PASSIVE_ONLY_VULN_CLASSES) {
             return ActiveScanResult(target, 0, null, "Passive-only vulnerability class")
@@ -298,13 +304,15 @@ class ActiveAiScanner(
 
         // Measure baseline response time
         val baselineStart = System.currentTimeMillis()
-        val baselineResponse = sendRequestWithTimeout(target.originalRequest.request())
+        val baselineResponse = sendRequestWithTimeout(
+            request = target.originalRequest.request(),
+            traceId = traceId,
+            target = target,
+            phase = "baseline"
+        )
             ?: return ActiveScanResult(target, 0, null, "Failed to send baseline request (timeout)")
         val baselineTime = System.currentTimeMillis() - baselineStart
-        val baselineRequestResponse = HttpRequestResponse.httpRequestResponse(
-            target.originalRequest.request(),
-            baselineResponse.response()
-        )
+        val baselineRequestResponse = baselineResponse
 
         val authzConfirmation = if (vulnClass in ScanPolicy.AUTHZ_BYPASS_CLASSES) {
             executeAuthzBypassCheck(target, baselineRequestResponse)
@@ -360,15 +368,25 @@ class ActiveAiScanner(
             try {
                 // Test TRUE condition
                 val trueRequest = injectPayload(target.originalRequest.request(), target.injectionPoint, truePayload.value)
-                val trueResponse = sendRequestWithTimeout(trueRequest) ?: continue
-                val trueRequestResponse = HttpRequestResponse.httpRequestResponse(trueRequest, trueResponse.response())
+                val trueRequestResponse = sendRequestWithTimeout(
+                    request = trueRequest,
+                    traceId = traceId,
+                    target = target,
+                    phase = "boolean_true",
+                    payload = truePayload
+                ) ?: continue
 
                 Thread.sleep(requestDelayMs)
 
                 // Test FALSE condition
                 val falseRequest = injectPayload(target.originalRequest.request(), target.injectionPoint, falsePayload.value)
-                val falseResponse = sendRequestWithTimeout(falseRequest) ?: continue
-                val falseRequestResponse = HttpRequestResponse.httpRequestResponse(falseRequest, falseResponse.response())
+                val falseRequestResponse = sendRequestWithTimeout(
+                    request = falseRequest,
+                    traceId = traceId,
+                    target = target,
+                    phase = "boolean_false",
+                    payload = falsePayload
+                ) ?: continue
 
                 // Perform dual confirmation
                 val confirmation = responseAnalyzer.analyzeBooleanBasedDual(
@@ -404,11 +422,14 @@ class ActiveAiScanner(
 
                 // Send request with timeout
                 val startTime = System.currentTimeMillis()
-                val response = sendRequestWithTimeout(modifiedRequest) ?: continue
+                val modifiedRequestResponse = sendRequestWithTimeout(
+                    request = modifiedRequest,
+                    traceId = traceId,
+                    target = target,
+                    phase = "payload_test",
+                    payload = payload
+                ) ?: continue
                 val responseTime = System.currentTimeMillis() - startTime
-
-                // Create HttpRequestResponse for analysis
-                val modifiedRequestResponse = HttpRequestResponse.httpRequestResponse(modifiedRequest, response.response())
 
                 // Analyze response
                 val confirmation = when {
@@ -498,11 +519,13 @@ class ActiveAiScanner(
                     target.injectionPoint,
                     payload.value
                 )
-                val response = sendRequestWithTimeout(modifiedRequest) ?: continue
-                val modifiedRequestResponse = HttpRequestResponse.httpRequestResponse(
-                    modifiedRequest,
-                    response.response()
-                )
+                val modifiedRequestResponse = sendRequestWithTimeout(
+                    request = modifiedRequest,
+                    traceId = "active-scan-" + UUID.randomUUID().toString(),
+                    target = target,
+                    phase = "idor_test",
+                    payload = payload
+                ) ?: continue
 
                 val confirmation = analyzeIdor(
                     target,
@@ -581,11 +604,12 @@ class ActiveAiScanner(
         if (!hasAuthContext(request)) return null
 
         val strippedRequest = stripAuthHeaders(request)
-        val response = sendRequestWithTimeout(strippedRequest) ?: return null
-        val strippedRequestResponse = HttpRequestResponse.httpRequestResponse(
-            strippedRequest,
-            response.response()
-        )
+        val strippedRequestResponse = sendRequestWithTimeout(
+            request = strippedRequest,
+            traceId = "active-scan-" + UUID.randomUUID().toString(),
+            target = target,
+            phase = "authz_bypass"
+        ) ?: return null
 
         val baselineStatus = baseline.response()?.statusCode() ?: 0
         val strippedStatus = strippedRequestResponse.response()?.statusCode() ?: 0
@@ -644,11 +668,13 @@ class ActiveAiScanner(
         if (buildFullResponse(baseline).contains(payload.value)) return null
         if (!isCacheable(modified)) return null
 
-        val followUpResponse = sendRequestWithTimeout(target.originalRequest.request()) ?: return null
-        val followUp = HttpRequestResponse.httpRequestResponse(
-            target.originalRequest.request(),
-            followUpResponse.response()
-        )
+        val followUp = sendRequestWithTimeout(
+            request = target.originalRequest.request(),
+            traceId = "active-scan-" + UUID.randomUUID().toString(),
+            target = target,
+            phase = "cache_follow_up",
+            payload = payload
+        ) ?: return null
         val followUpFull = buildFullResponse(followUp)
         if (!followUpFull.contains(payload.value)) return null
         if (!isCacheHit(followUp)) return null
@@ -675,11 +701,13 @@ class ActiveAiScanner(
         if (!sensitiveDataRegex.containsMatchIn(modifiedBody)) return null
         if (!isCacheable(modified)) return null
 
-        val followUpResponse = sendRequestWithTimeout(target.originalRequest.request()) ?: return null
-        val followUp = HttpRequestResponse.httpRequestResponse(
-            target.originalRequest.request(),
-            followUpResponse.response()
-        )
+        val followUp = sendRequestWithTimeout(
+            request = target.originalRequest.request(),
+            traceId = "active-scan-" + UUID.randomUUID().toString(),
+            target = target,
+            phase = "cache_follow_up",
+            payload = payload
+        ) ?: return null
         val followUpBody = followUp.response()?.bodyToString() ?: ""
         if (!sensitiveDataRegex.containsMatchIn(followUpBody)) return null
         if (!isCacheHit(followUp)) return null
@@ -817,8 +845,20 @@ class ActiveAiScanner(
             target.injectionPoint,
             oastUrl
         )
-        val oastResponse = sendRequestWithTimeout(oastRequest) ?: return null
-        val oastRequestResponse = HttpRequestResponse.httpRequestResponse(oastRequest, oastResponse.response())
+        val payload = Payload(
+            value = oastUrl,
+            vulnClass = VulnClass.SSRF,
+            detectionMethod = DetectionMethod.OUT_OF_BAND,
+            risk = PayloadRisk.SAFE,
+            expectedEvidence = "Collaborator interaction"
+        )
+        val oastRequestResponse = sendRequestWithTimeout(
+            request = oastRequest,
+            traceId = "active-scan-" + UUID.randomUUID().toString(),
+            target = target,
+            phase = "ssrf_oast",
+            payload = payload
+        ) ?: return null
 
         val timeoutMs = maxOf(5000L, timeoutSeconds.toLong() * 1000L)
         val start = System.currentTimeMillis()
@@ -826,13 +866,6 @@ class ActiveAiScanner(
             val interactions = client.getAllInteractions()
             if (interactions.isNotEmpty()) {
                 val types = interactions.joinToString(", ") { it.type().toString() }
-                val payload = Payload(
-                    value = oastUrl,
-                    vulnClass = VulnClass.SSRF,
-                    detectionMethod = DetectionMethod.OUT_OF_BAND,
-                    risk = PayloadRisk.SAFE,
-                    expectedEvidence = "Collaborator interaction"
-                )
                 return VulnConfirmation(
                     target = target,
                     payload = payload,
@@ -849,19 +882,131 @@ class ActiveAiScanner(
         return null
     }
 
-    private fun sendRequestWithTimeout(request: HttpRequest): HttpRequestResponse? {
+    private fun sendRequestWithTimeout(
+        request: HttpRequest,
+        traceId: String? = null,
+        target: ActiveScanTarget? = null,
+        phase: String = "request",
+        payload: Payload? = null
+    ): HttpRequestResponse? {
         val timeout = timeoutSeconds.coerceAtLeast(5).toLong()
+        val startMs = System.currentTimeMillis()
+        recordActiveRequestDispatch(request, traceId, target, phase, payload)
         val future = requestExecutor.submit(Callable { api.http().sendRequest(request) })
         return try {
-            future.get(timeout, TimeUnit.SECONDS)
+            val requestResponse = future.get(timeout, TimeUnit.SECONDS)
+            persistActiveTraffic(requestResponse)
+            recordActiveRequestResponse(requestResponse, System.currentTimeMillis() - startMs, traceId, target, phase, payload)
+            requestResponse
         } catch (e: TimeoutException) {
             future.cancel(true)
             api.logging().logToError("[ActiveAiScanner] Request timeout after ${timeout}s for ${request.url().take(80)}")
+            recordActiveRequestError(request, "timeout", System.currentTimeMillis() - startMs, traceId, target, phase, payload)
             null
         } catch (e: Exception) {
             future.cancel(true)
             api.logging().logToError("[ActiveAiScanner] Request error: ${e.message}")
+            recordActiveRequestError(request, e.message ?: "request error", System.currentTimeMillis() - startMs, traceId, target, phase, payload)
             null
+        }
+    }
+
+    private fun recordActiveRequestDispatch(
+        request: HttpRequest,
+        traceId: String?,
+        target: ActiveScanTarget?,
+        phase: String,
+        payload: Payload?
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.SCANNER_SEND,
+            source = "active_scanner",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Active test [$phase]: ${request.method()} ${request.url().take(120)}",
+            metadata = activeLogMetadata(traceId, target, phase, payload) + mapOf(
+                "operation" to "active_test",
+                "status" to "sent",
+                "url" to request.url().take(200),
+                "method" to request.method()
+            )
+        )
+    }
+
+    private fun recordActiveRequestResponse(
+        requestResponse: HttpRequestResponse,
+        durationMs: Long,
+        traceId: String?,
+        target: ActiveScanTarget?,
+        phase: String,
+        payload: Payload?
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.RESPONSE_COMPLETE,
+            source = "active_scanner",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Active test [$phase] completed: ${requestResponse.request().method()} ${requestResponse.request().url().take(120)}",
+            durationMs = durationMs,
+            responseChars = requestResponse.response()?.bodyToString()?.length ?: 0,
+            metadata = activeLogMetadata(traceId, target, phase, payload) + mapOf(
+                "operation" to "active_test",
+                "status" to "ok",
+                "url" to requestResponse.request().url().take(200),
+                "method" to requestResponse.request().method(),
+                "httpStatus" to (requestResponse.response()?.statusCode()?.toString() ?: "0")
+            )
+        )
+    }
+
+    private fun recordActiveRequestError(
+        request: HttpRequest,
+        error: String,
+        durationMs: Long,
+        traceId: String?,
+        target: ActiveScanTarget?,
+        phase: String,
+        payload: Payload?
+    ) {
+        aiRequestLogger?.log(
+            type = ActivityType.ERROR,
+            source = "active_scanner",
+            backendId = ACTIVE_SCANNER_BACKEND_ID,
+            detail = "Active test [$phase] failed: ${error.take(200)}",
+            durationMs = durationMs,
+            metadata = activeLogMetadata(traceId, target, phase, payload) + mapOf(
+                "operation" to "active_test",
+                "status" to "error",
+                "url" to request.url().take(200),
+                "method" to request.method()
+            )
+        )
+    }
+
+    private fun activeLogMetadata(
+        traceId: String?,
+        target: ActiveScanTarget?,
+        phase: String,
+        payload: Payload?
+    ): Map<String, String> {
+        val metadata = mutableMapOf<String, String>()
+        if (!traceId.isNullOrBlank()) metadata["traceId"] = traceId
+        metadata["phase"] = phase
+        if (target != null) {
+            metadata["targetId"] = target.id.take(200)
+            metadata["vulnClass"] = target.vulnHint.vulnClass.name
+            metadata["injectionPoint"] = "${target.injectionPoint.type}:${target.injectionPoint.name}".take(200)
+        }
+        if (payload != null) {
+            metadata["payloadType"] = payload.detectionMethod.name
+            metadata["payloadPreview"] = payload.value.take(200)
+        }
+        return metadata
+    }
+
+    private fun persistActiveTraffic(requestResponse: HttpRequestResponse) {
+        try {
+            api.siteMap().add(requestResponse)
+        } catch (e: Exception) {
+            api.logging().logToError("[ActiveAiScanner] Failed to persist request/response to Site Map: ${e.message}")
         }
     }
 
@@ -1010,6 +1155,10 @@ class ActiveAiScanner(
             baseUrl = baseUrl,
             issues = api.siteMap().issues().map { issue -> issue.name() to issue.baseUrl() }
         )
+    }
+
+    private companion object {
+        private const val ACTIVE_SCANNER_BACKEND_ID = "burp-http"
     }
 
     private fun injectPayload(request: HttpRequest, point: InjectionPoint, payload: String): HttpRequest {

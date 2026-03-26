@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-03-26
+
+### Added
+
+- **Active Scanner Request/Response Visibility**:
+  - Active scanner generated HTTP requests now emit AI Logger entries for dispatch, completion, and errors under `source = active_scanner`.
+  - Active scanner generated HTTP request/response pairs are now persisted into Burp Site Map so extension-generated test traffic is reviewable inside Burp.
+
+### Changed
+
+- **Scanner Activity Correlation**:
+  - Active scanner request logging now includes per-request trace IDs, phase labels, vulnerability class, injection point metadata, and payload previews for easier investigation.
+
 ## [0.4.1] - 2026-03-26
 
 ### Fixed
