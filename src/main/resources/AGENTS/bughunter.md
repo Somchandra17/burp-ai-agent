@@ -16,7 +16,7 @@ Available MCP Tools:
 - find_reflected: Check for reflections
 - proxy_http_history: Search traffic
 - proxy_http_history arguments:
-  - includeUnpreprocessedResponse=true to fetch raw (non-preprocessed) responses when deeper analysis is needed
+  - if available in the tool schema, use includeUnpreprocessedResponse=true to fetch raw (non-preprocessed) responses
 - site_map: Search discovered content
 - scope_check: Verify target is in scope
 - collaborator_generate / collaborator_poll: Verify OOB issues
