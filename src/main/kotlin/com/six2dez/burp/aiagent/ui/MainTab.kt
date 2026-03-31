@@ -8,6 +8,7 @@ import com.six2dez.burp.aiagent.backends.BackendRegistry
 import com.six2dez.burp.aiagent.config.AgentSettingsRepository
 import com.six2dez.burp.aiagent.context.ContextCapture
 import com.six2dez.burp.aiagent.mcp.McpSupervisor
+import com.six2dez.burp.aiagent.mcp.tools.ResponsePreprocessorSettings
 import com.six2dez.burp.aiagent.redact.PrivacyMode
 import com.six2dez.burp.aiagent.scanner.ScanKnowledgeBase
 import com.six2dez.burp.aiagent.supervisor.AgentSupervisor
@@ -91,7 +92,17 @@ class MainTab(
                 aiRequestLogger?.enabled = settings.aiRequestLoggerEnabled
                 aiRequestLogger?.maxEntries = settings.aiRequestLoggerMaxEntries
                 supervisor.applySettings(settings)
-                mcpSupervisor.applySettings(settings.mcpSettings, settings.privacyMode, settings.determinismMode)
+                mcpSupervisor.applySettings(
+                    settings.mcpSettings,
+                    settings.privacyMode,
+                    settings.determinismMode,
+                    ResponsePreprocessorSettings(
+                        preprocessProxyHistory = settings.preprocessProxyHistory,
+                        preprocessMaxResponseSizeKb = settings.preprocessMaxResponseSizeKb,
+                        preprocessFilterBinaryContent = settings.preprocessFilterBinaryContent,
+                        preprocessAllowedContentTypes = settings.preprocessAllowedContentTypes
+                    )
+                )
             },
             validateBackend = { validateBackendCommand(it) },
             ensureBackendReady = { ensureBackendReady(it) },
@@ -375,7 +386,17 @@ class MainTab(
             val settings = settingsPanel.currentSettings()
             val updated = settings.copy(mcpSettings = settings.mcpSettings.copy(enabled = enabled))
             settingsRepo.save(updated)
-            mcpSupervisor.applySettings(updated.mcpSettings, updated.privacyMode, updated.determinismMode)
+            mcpSupervisor.applySettings(
+                updated.mcpSettings,
+                updated.privacyMode,
+                updated.determinismMode,
+                ResponsePreprocessorSettings(
+                    preprocessProxyHistory = updated.preprocessProxyHistory,
+                    preprocessMaxResponseSizeKb = updated.preprocessMaxResponseSizeKb,
+                    preprocessFilterBinaryContent = updated.preprocessFilterBinaryContent,
+                    preprocessAllowedContentTypes = updated.preprocessAllowedContentTypes
+                )
+            )
             renderStatus()
         }
         settingsPanel.onPassiveAiEnabledChanged = passiveSync@{ enabled ->
@@ -404,7 +425,17 @@ class MainTab(
             val settings = settingsPanel.currentSettings()
             val updated = settings.copy(mcpSettings = settings.mcpSettings.copy(enabled = enabled))
             settingsRepo.save(updated)
-            mcpSupervisor.applySettings(updated.mcpSettings, updated.privacyMode, updated.determinismMode)
+            mcpSupervisor.applySettings(
+                updated.mcpSettings,
+                updated.privacyMode,
+                updated.determinismMode,
+                ResponsePreprocessorSettings(
+                    preprocessProxyHistory = updated.preprocessProxyHistory,
+                    preprocessMaxResponseSizeKb = updated.preprocessMaxResponseSizeKb,
+                    preprocessFilterBinaryContent = updated.preprocessFilterBinaryContent,
+                    preprocessAllowedContentTypes = updated.preprocessAllowedContentTypes
+                )
+            )
             renderStatus()
         }
         passiveToggle.addActionListener {

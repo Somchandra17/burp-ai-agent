@@ -64,6 +64,11 @@ data class AgentSettings(
     val autoRestart: Boolean,
     val auditEnabled: Boolean,
     val mcpSettings: McpSettings,
+    // MCP proxy history preprocessing settings
+    val preprocessProxyHistory: Boolean = Defaults.PREPROCESS_PROXY_HISTORY_ENABLED,
+    val preprocessMaxResponseSizeKb: Int = Defaults.PREPROCESS_MAX_RESPONSE_SIZE_KB,
+    val preprocessFilterBinaryContent: Boolean = Defaults.PREPROCESS_FILTER_BINARY_CONTENT,
+    val preprocessAllowedContentTypes: Set<String> = Defaults.PREPROCESS_ALLOWED_CONTENT_TYPES,
     // Passive AI Scanner settings
     val passiveAiEnabled: Boolean = false,
     val passiveAiRateSeconds: Int = 5,
@@ -175,6 +180,16 @@ class AgentSettingsRepository(api: MontoyaApi) {
             autoRestart = prefs.getBoolean(KEY_AUTORESTART) ?: true,
             auditEnabled = prefs.getBoolean(KEY_AUDIT_ENABLED) ?: false,
             mcpSettings = mcpSettings,
+            preprocessProxyHistory = prefs.getBoolean(KEY_PREPROCESS_PROXY_HISTORY)
+                ?: Defaults.PREPROCESS_PROXY_HISTORY_ENABLED,
+            preprocessMaxResponseSizeKb = (prefs.getInteger(KEY_PREPROCESS_MAX_RESPONSE_SIZE_KB)
+                ?: Defaults.PREPROCESS_MAX_RESPONSE_SIZE_KB).coerceIn(1, 10_240),
+            preprocessFilterBinaryContent = prefs.getBoolean(KEY_PREPROCESS_FILTER_BINARY_CONTENT)
+                ?: Defaults.PREPROCESS_FILTER_BINARY_CONTENT,
+            preprocessAllowedContentTypes = parseContentTypeSet(
+                prefs.getString(KEY_PREPROCESS_ALLOWED_CONTENT_TYPES),
+                Defaults.PREPROCESS_ALLOWED_CONTENT_TYPES
+            ),
             passiveAiEnabled = prefs.getBoolean(KEY_PASSIVE_AI_ENABLED) ?: false,
             passiveAiRateSeconds = (prefs.getInteger(KEY_PASSIVE_AI_RATE) ?: 5).coerceIn(1, 60),
             passiveAiScopeOnly = prefs.getBoolean(KEY_PASSIVE_AI_SCOPE_ONLY) ?: true,
@@ -270,6 +285,10 @@ class AgentSettingsRepository(api: MontoyaApi) {
             autoRestart = true,
             auditEnabled = false,
             mcpSettings = defaultMcpSettings(),
+            preprocessProxyHistory = Defaults.PREPROCESS_PROXY_HISTORY_ENABLED,
+            preprocessMaxResponseSizeKb = Defaults.PREPROCESS_MAX_RESPONSE_SIZE_KB,
+            preprocessFilterBinaryContent = Defaults.PREPROCESS_FILTER_BINARY_CONTENT,
+            preprocessAllowedContentTypes = Defaults.PREPROCESS_ALLOWED_CONTENT_TYPES,
             passiveAiEnabled = false,
             passiveAiRateSeconds = 5,
             passiveAiScopeOnly = true,
@@ -354,6 +373,16 @@ class AgentSettingsRepository(api: MontoyaApi) {
         prefs.setBoolean(KEY_AUTORESTART, settings.autoRestart)
         prefs.setBoolean(KEY_AUDIT_ENABLED, settings.auditEnabled)
         saveMcpSettings(settings.mcpSettings)
+        prefs.setBoolean(KEY_PREPROCESS_PROXY_HISTORY, settings.preprocessProxyHistory)
+        prefs.setInteger(
+            KEY_PREPROCESS_MAX_RESPONSE_SIZE_KB,
+            settings.preprocessMaxResponseSizeKb.coerceIn(1, 10_240)
+        )
+        prefs.setBoolean(KEY_PREPROCESS_FILTER_BINARY_CONTENT, settings.preprocessFilterBinaryContent)
+        prefs.setString(
+            KEY_PREPROCESS_ALLOWED_CONTENT_TYPES,
+            serializeContentTypeSet(settings.preprocessAllowedContentTypes)
+        )
         prefs.setBoolean(KEY_PASSIVE_AI_ENABLED, settings.passiveAiEnabled)
         prefs.setInteger(KEY_PASSIVE_AI_RATE, settings.passiveAiRateSeconds)
         prefs.setBoolean(KEY_PASSIVE_AI_SCOPE_ONLY, settings.passiveAiScopeOnly)
@@ -526,6 +555,10 @@ class AgentSettingsRepository(api: MontoyaApi) {
         private const val KEY_MCP_TOOL_TOGGLES = "mcp.tools.toggles"
         private const val KEY_MCP_UNSAFE_TOOLS = "mcp.unsafe.tools"
         private const val KEY_MCP_UNSAFE = "mcp.unsafe.enabled"
+        private const val KEY_PREPROCESS_PROXY_HISTORY = "mcp.preprocess.proxy.history"
+        private const val KEY_PREPROCESS_MAX_RESPONSE_SIZE_KB = "mcp.preprocess.max.response.size.kb"
+        private const val KEY_PREPROCESS_FILTER_BINARY_CONTENT = "mcp.preprocess.filter.binary.content"
+        private const val KEY_PREPROCESS_ALLOWED_CONTENT_TYPES = "mcp.preprocess.allowed.content.types"
         private const val KEY_PASSIVE_AI_ENABLED = "passive.ai.enabled"
         private const val KEY_PASSIVE_AI_RATE = "passive.ai.rate.seconds"
         private const val KEY_PASSIVE_AI_SCOPE_ONLY = "passive.ai.scope.only"
@@ -822,9 +855,26 @@ Response Language: English.
             return if (parsed.isEmpty()) fallback else parsed
         }
 
+        private fun parseContentTypeSet(raw: String?, fallback: Set<String>): Set<String> {
+            val parsed = raw.orEmpty()
+                .split(',')
+                .map { it.trim().lowercase() }
+                .filter { it.isNotBlank() }
+                .toSet()
+            return if (parsed.isEmpty()) fallback else parsed
+        }
+
         private fun serializeIdSet(ids: Set<String>): String {
             return ids
                 .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .toSortedSet()
+                .joinToString(",")
+        }
+
+        private fun serializeContentTypeSet(contentTypes: Set<String>): String {
+            return contentTypes
+                .map { it.trim().lowercase() }
                 .filter { it.isNotBlank() }
                 .toSortedSet()
                 .joinToString(",")

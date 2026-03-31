@@ -3,6 +3,7 @@ package com.six2dez.burp.aiagent.mcp
 import burp.api.montoya.MontoyaApi
 import com.six2dez.burp.aiagent.audit.AiRequestLogger
 import com.six2dez.burp.aiagent.config.McpSettings
+import com.six2dez.burp.aiagent.mcp.tools.ResponsePreprocessorSettings
 import com.six2dez.burp.aiagent.mcp.tools.CollaboratorRegistry
 import com.six2dez.burp.aiagent.mcp.tools.ScannerTaskRegistry
 import com.six2dez.burp.aiagent.redact.PrivacyMode
@@ -41,6 +42,7 @@ class McpSupervisor(
     private val settingsRef = AtomicReference<McpSettings?>(null)
     private val privacyRef = AtomicReference(PrivacyMode.STRICT)
     private val determinismRef = AtomicReference(false)
+    private val preprocessRef = AtomicReference(ResponsePreprocessorSettings())
     private val restartAttempts = AtomicInteger(0)
     private val takeoverAttempts = AtomicInteger(0)
     private val takeoverClient: McpTakeoverClient = takeoverClientOverride ?: object : McpTakeoverClient {
@@ -60,14 +62,16 @@ class McpSupervisor(
         stdioBridge.setAiRequestLogger(logger)
     }
 
-    fun applySettings(settings: McpSettings, privacyMode: PrivacyMode, determinismMode: Boolean) {
-        val previousSettings = settingsRef.get()
-        val previousPrivacy = privacyRef.get()
-        val previousDeterminism = determinismRef.get()
-
+    fun applySettings(
+        settings: McpSettings,
+        privacyMode: PrivacyMode,
+        determinismMode: Boolean,
+        preprocessSettings: ResponsePreprocessorSettings
+    ) {
         settingsRef.set(settings)
         privacyRef.set(privacyMode)
         determinismRef.set(determinismMode)
+        preprocessRef.set(preprocessSettings)
         ScannerTaskRegistry.configureTtlMinutes(settings.scanTaskTtlMinutes)
         CollaboratorRegistry.configureTtlMinutes(settings.collaboratorClientTtlMinutes)
         ScannerTaskRegistry.setLogger { api.logging().logToOutput("[ScannerTaskRegistry] $it") }
@@ -93,10 +97,10 @@ class McpSupervisor(
 
         restartAttempts.set(0)
         takeoverAttempts.set(0)
-        startInternal(settings, privacyMode, determinismMode)
+        startInternal(settings, privacyMode, determinismMode, preprocessSettings)
 
         if (settings.stdioEnabled) {
-            stdioBridge.start(settings, privacyMode, determinismMode)
+            stdioBridge.start(settings, privacyMode, determinismMode, preprocessSettings)
         } else {
             stdioBridge.stop()
         }
@@ -126,8 +130,13 @@ class McpSupervisor(
         stdioBridge.stop()
     }
 
-    private fun startInternal(settings: McpSettings, privacyMode: PrivacyMode, determinismMode: Boolean) {
-        serverManager.start(settings, privacyMode, determinismMode) { state ->
+    private fun startInternal(
+        settings: McpSettings,
+        privacyMode: PrivacyMode,
+        determinismMode: Boolean,
+        preprocessSettings: ResponsePreprocessorSettings
+    ) {
+        serverManager.start(settings, privacyMode, determinismMode, preprocessSettings) { state ->
             stateRef.set(state)
             if (state is McpServerState.Running) {
                 restartAttempts.set(0)
@@ -208,7 +217,7 @@ class McpSupervisor(
         scheduler.schedule({
             val current = settingsRef.get() ?: return@schedule
             if (!current.enabled) return@schedule
-            startInternal(current, privacyRef.get(), determinismRef.get())
+            startInternal(current, privacyRef.get(), determinismRef.get(), preprocessRef.get())
         }, delayMs, TimeUnit.MILLISECONDS)
     }
 
