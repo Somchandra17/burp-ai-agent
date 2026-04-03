@@ -101,12 +101,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   - `ScanKnowledgeBase` is now cleared when the passive scanner is disabled, preventing accumulated tech stack and vulnerability data from bleeding across scopes.
   - `PersistentPromptCache` is now namespaced per Burp project (`~/.burp-ai-agent/cache/{projectId}/`), preventing cached analysis from one project from being served in another.
 
+- **NVIDIA NIM Backend**:
+  - New NVIDIA NIM backend with SSE streaming, `chat_template_kwargs.thinking` support, and POST-based health checks against the chat completions endpoint.
+  - Backend configuration fields in the UI for NVIDIA NIM URL, model, API key, custom headers, and timeout.
+  - `OpenAiCompatibleBackend` now supports streaming mode, payload customization hooks, default headers, and custom health check providers, enabling new OpenAI-compatible backends with minimal boilerplate.
+
 ### Changed
 
 - **Passive Scanner Settings UI**:
   - Added `Batch size (1=off)` spinner, `Persistent cache` checkbox, `Persistent TTL (hrs)` and `Persistent max (MB)` spinners to the AI Passive Scanner settings tab.
 - **Active Scanner Settings UI**:
   - Added `AI adaptive payloads` checkbox to the AI Active Scanner settings tab.
+- **HTTP 429 Chat Error Handling**:
+  - Improved chat error handling so HTTP 429 and other error responses no longer leave the UI stuck on "Thinking...".
 
 ### Fixed
 
@@ -166,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **MCP Tool Call Prompt Format**:
   - Chat system prompt for MCP tools changed from inline description to JSON code block format with explicit invocation instructions.
   - Tool descriptions now include parameter schemas (`includeSchemas: true`) for better AI tool usage accuracy.
+
 
 ## [0.4.0] - 2026-03-06
 
